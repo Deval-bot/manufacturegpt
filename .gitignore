@@ -1,0 +1,12 @@
+# API keys — must never be uploaded
+.env
+
+# Virtual environment — huge folder, not needed on GitHub
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Streamlit config
+.streamlit/

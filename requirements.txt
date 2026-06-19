@@ -1,0 +1,5 @@
+google-generativeai
+groq
+streamlit
+graphviz
+python-dotenv
