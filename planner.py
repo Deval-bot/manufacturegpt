@@ -1,12 +1,23 @@
 # planner.py
-# Handles all AI communication
-# Uses Google Gemini (free) with Groq as automatic backup (also free)
+# ════════════════════════════════════════════════════════════════
+# THE COGNITIVE CORE (grounded, industry-aware planner)
+# ════════════════════════════════════════════════════════════════
+# Uses Google Gemini (free) with Groq backup.
+# Now reads industry knowledge from industries.py to ground the LLM,
+# preventing hallucination and forcing industry-specific depth.
+#
+# Includes Checkpoint B: intent confirmation (interpret_task) — the
+# AI reflects back what it understood BEFORE planning, so a human can
+# confirm or correct interpretation at the cheapest possible point.
+# ════════════════════════════════════════════════════════════════
 
 import json
 import os
 from dotenv import load_dotenv
 
-# This line reads your API keys from the .env file
+# Import the knowledge layer
+from industries import build_equipment_context, build_example_block, get_industry
+
 load_dotenv()
 
 # ── SETUP GEMINI ──────────────────────────────────────────
@@ -28,195 +39,184 @@ try:
         print("Groq ready as backup")
     else:
         groq_client = None
-        print("WARNING: No Groq key found in .env")
 except ImportError:
     groq_client = None
 
 
-# ── THE PROMPT TEMPLATE ───────────────────────────────────
-# This is the Chain-of-Thought prompt from the LLMAPM paper
-# It tells the AI exactly how to think about the problem
+# ════════════════════════════════════════════════════════════════
+# CHECKPOINT B — INTENT CONFIRMATION
+# Before any planning, the AI reflects back what it understood.
+# This catches misunderstandings at the cheapest possible point.
+# ════════════════════════════════════════════════════════════════
 
-def get_system_prompt():
-    return """
-You are an expert manufacturing process planning engineer 
-specialising in Industry 5.0 flexible manufacturing systems.
+def interpret_task(task, industry_key):
+    """
+    Returns the AI's interpretation of the task for human confirmation.
+    Does NOT plan yet — just confirms understanding.
+    """
+    context = build_equipment_context(industry_key)
 
-Your job: convert a user's plain English task description 
-into a structured manufacturing workflow JSON.
+    prompt = f"""
+{context}
 
-Follow this thinking process step by step:
+A user has described this manufacturing task:
+"{task}"
 
-STEP 1 - IDENTIFY
-Extract the key objects and actions from the task.
-What needs to be moved, assembled, inspected, or sorted?
-What equipment is mentioned or implied?
+Before planning, summarise your understanding in this exact JSON format
+(no markdown, just JSON):
+{{
+    "understood_goal": "one sentence: what the user wants to achieve",
+    "equipment_needed": ["list", "of", "equipment", "from the available list"],
+    "task_type": "sequential or conditional or parallel",
+    "missing_or_unclear": "anything vague or any equipment the task needs that is NOT in the available list — or 'nothing' if all clear",
+    "estimated_steps": "rough number of steps you expect"
+}}
+"""
+    raw = _call_llm(prompt, system="You are a manufacturing planning assistant. Return only JSON.")
+    return _parse_json(raw)
 
-STEP 2 - CLASSIFY the task type:
-- sequential: steps happen one after another (most common)
-- conditional: a decision point exists (if defect found, reject)
-- parallel: two things happen at the same time
 
-STEP 3 - DECOMPOSE into individual steps.
-Rule: each step uses ONLY ONE piece of equipment.
-For each step ask: what INPUT does it need? What OUTPUT does it produce?
+# ════════════════════════════════════════════════════════════════
+# THE GROUNDED PROMPT BUILDER
+# ════════════════════════════════════════════════════════════════
 
-STEP 4 - CONNECT the steps.
-The OUTPUT of step N must feed into the INPUT of step N+1.
-Data types must match across connected steps.
+def build_system_prompt(industry_key):
+    """Builds the full grounded system prompt with context + example."""
+    context = build_equipment_context(industry_key)
+    example = build_example_block(industry_key)
 
-RULES:
-- Each step = one component only
-- Data types must be: STRING, DOUBLE, INT, BOOL, or ARRAY
-- Always end with a reset step for robotic tasks
-- Generate between 4 and 10 steps
+    return f"""
+You are an expert manufacturing process planning engineer.
 
-Return ONLY a JSON object. No explanation. No markdown. 
-No ```json blocks. Just the raw JSON like this:
+{context}
 
-{
+CRITICAL RULES — these prevent errors:
+1. You may ONLY use equipment and APIs from the AVAILABLE EQUIPMENT list above.
+   If the task seems to need equipment NOT in the list, do NOT invent it —
+   instead add a note in the "warnings" field naming what is missing.
+2. Use ONLY the valid data types listed.
+3. Your workflow MUST respect every safety rule listed.
+4. The output of each step must feed logically into the next step's input.
+5. Generate realistic, INDUSTRY-SPECIFIC steps — not generic placeholders.
+   Match the depth shown in the example below.
+
+{example}
+
+Now follow this Chain-of-Thought process:
+STEP 1 - IDENTIFY the objects, actions, and equipment needed.
+STEP 2 - CLASSIFY the task type (sequential / conditional / parallel).
+STEP 3 - DECOMPOSE into steps, each using ONE piece of equipment.
+STEP 4 - CONNECT steps so outputs feed into inputs with matching data types.
+
+Return ONLY valid JSON (no markdown, no ```json blocks) in this format:
+{{
     "task_name": "short descriptive name",
     "task_type": "sequential",
-    "reasoning": "your step by step thinking here",
+    "industry": "{industry_key}",
+    "reasoning": "your step by step thinking",
+    "warnings": "any equipment the task needed but was not available, or 'none'",
     "steps": [
-        {
+        {{
             "step_id": 1,
-            "description": "what this step does in plain English",
-            "component": "name of equipment used",
-            "api": "function_name_called",
-            "input_data": {
-                "type": "ARRAY",
-                "source": "user_input",
-                "value": "start_position"
-            },
-            "output_data": {
-                "type": "ARRAY",
-                "value": "position_above_target"
-            }
-        }
+            "description": "what this step does",
+            "component": "equipment name from the available list",
+            "api": "function name from that equipment's API list",
+            "input_data": {{"type": "DATA_TYPE", "source": "user_input or step_N_output", "value": "parameter_name"}},
+            "output_data": {{"type": "DATA_TYPE", "value": "output_name"}}
+        }}
     ]
-}
+}}
 """
 
 
-def get_user_message(task):
-    return f"""
+# ════════════════════════════════════════════════════════════════
+# LLM CALLERS (Gemini primary, Groq backup)
+# ════════════════════════════════════════════════════════════════
+
+def _call_llm(prompt, system="You are a helpful assistant. Return only JSON."):
+    """Internal: tries Gemini, falls back to Groq. Returns raw text."""
+    if gemini_key:
+        try:
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash",
+                system_instruction=system,
+                generation_config={"temperature": 0.2, "response_mime_type": "application/json"}
+            )
+            return model.generate_content(prompt).text
+        except Exception as e:
+            print(f"Gemini failed: {e}. Trying Groq...")
+
+    if groq_client:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return resp.choices[0].message.content
+
+    raise Exception("No LLM available. Check API keys in .env")
+
+
+def _parse_json(raw):
+    """Internal: safely parse JSON, cleaning markdown if present."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split('\n')
+        raw = '\n'.join(lines[1:-1])
+    return json.loads(raw)
+
+
+# ════════════════════════════════════════════════════════════════
+# MAIN: GENERATE WORKFLOW (now industry-aware)
+# ════════════════════════════════════════════════════════════════
+
+def generate_workflow(task, industry_key="steel"):
+    """
+    Generates a grounded, industry-specific workflow.
+    industry_key selects which knowledge profile to ground the LLM with.
+    """
+    print(f"Generating workflow for industry: {industry_key}")
+    system = build_system_prompt(industry_key)
+    user_msg = f"""
 Create a manufacturing workflow for this task:
 
 TASK: {task}
 
-Think through it step by step.
-Each step uses one component.
-Outputs of each step feed into inputs of the next.
-Return ONLY the JSON. Nothing else before or after it.
+Remember: use ONLY available equipment, respect safety rules,
+match the example's depth, return ONLY JSON.
 """
-
-
-# ── GEMINI CALL ───────────────────────────────────────────
-
-def call_gemini(task):
-    print("Calling Google Gemini...")
-
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=get_system_prompt(),
-        generation_config={
-            "temperature": 0.2,
-            "response_mime_type": "application/json"
-        }
-    )
-
-    response = model.generate_content(get_user_message(task))
-    raw = response.text.strip()
-
-    # Clean up if model accidentally added markdown blocks
-    if raw.startswith("```"):
-        lines = raw.split('\n')
-        raw = '\n'.join(lines[1:-1])
-
-    workflow = json.loads(raw)
-    print("Gemini succeeded")
+    raw = _call_llm(user_msg if False else system + "\n\nUSER TASK:\n" + task)
+    # Note: we send the grounded system prompt + task together for reliability
+    workflow = _parse_json(raw)
+    print("Workflow generated.")
     return workflow
 
 
-# ── GROQ CALL ─────────────────────────────────────────────
-
-def call_groq(task):
-    print("Calling Groq (Llama 3.3 70B)...")
-
-    if not groq_client:
-        raise Exception("Groq not available. Check GROQ_API_KEY in .env")
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": get_system_prompt()},
-            {"role": "user", "content": get_user_message(task)}
-        ]
-    )
-
-    raw = response.choices[0].message.content.strip()
-
-    # Clean up markdown if present
-    if raw.startswith("```"):
-        lines = raw.split('\n')
-        raw = '\n'.join(lines[1:-1])
-
-    workflow = json.loads(raw)
-    print("Groq succeeded")
-    return workflow
-
-
-# ── MAIN FUNCTION ─────────────────────────────────────────
-# This is what app.py calls
-# Tries Gemini first, automatically uses Groq if Gemini fails
-
-def generate_workflow(task):
-    
-    # Try Gemini first
-    if gemini_key:
-        try:
-            return call_gemini(task)
-        except Exception as e:
-            print(f"Gemini failed: {e}")
-            print("Switching to Groq...")
-
-    # Try Groq as backup
-    if groq_client:
-        try:
-            return call_groq(task)
-        except Exception as e:
-            raise Exception(f"Both APIs failed. Last error: {e}")
-
-    raise Exception(
-        "No API available. "
-        "Check that GEMINI_API_KEY and GROQ_API_KEY are in your .env file."
-    )
-
-
-# ── QUICK TEST ────────────────────────────────────────────
-# Run this file directly to test: python planner.py
+# ════════════════════════════════════════════════════════════════
+# QUICK TEST
+# ════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("TESTING API CONNECTION")
-    print("="*50)
+    test_task = (
+        "Charge raw material into the blast furnace, control temperature "
+        "to tap molten iron, transport via ladle to the basic oxygen furnace, "
+        "blow oxygen to refine into steel, then pour into the continuous caster "
+        "to produce slabs"
+    )
 
-    test_task = """
-    Use a robotic arm with suction cup to pick a CPU chip 
-    from a parts tray and place it onto a motherboard socket. 
-    Reset to home position after completion.
-    """
+    print("\n" + "="*60)
+    print("CHECKPOINT B — INTENT CONFIRMATION:")
+    print("="*60)
+    interpretation = interpret_task(test_task, "steel")
+    print(json.dumps(interpretation, indent=2))
 
-    try:
-        result = generate_workflow(test_task)
-        print("\nSUCCESS! Workflow generated:")
-        print(json.dumps(result, indent=2))
-        print(f"\nTotal steps generated: {len(result.get('steps', []))}")
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        print("\nCheck:")
-        print("1. Your .env file has GEMINI_API_KEY=... on one line")
-        print("2. You ran: pip install google-generativeai groq python-dotenv")
-        print("3. Your key is correct at aistudio.google.com")
+    print("\n" + "="*60)
+    print("GENERATED STEEL WORKFLOW:")
+    print("="*60)
+    workflow = generate_workflow(test_task, "steel")
+    print(json.dumps(workflow, indent=2))
+    print(f"\nSteps: {len(workflow.get('steps', []))}")
+    print(f"Warnings: {workflow.get('warnings', 'none')}")
