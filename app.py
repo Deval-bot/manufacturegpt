@@ -18,6 +18,9 @@ from validator import validate_workflow
 from knowledge_builder import (
     propose_industry_profile, validate_industry_profile, finalize_profile
 )
+from simulator import (
+    propose_durations, build_duration_table, simulate, provenance_summary
+)
 # We need to register custom industries so planner/validator can use them
 import industries as industries_module
 
@@ -39,7 +42,9 @@ def init_state():
         "interpretation": None,
         "workflow": None,
         "validation": None,
-        "approved": False
+        "approved": False,
+        "duration_table": None,
+        "sim_result": None
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -66,7 +71,8 @@ st.caption(
 )
 
 # Progress indicator
-stages = ["1. Industry", "2. Knowledge", "3. Task", "4. Confirm", "5. Steps", "6. Validate"]
+stages = ["1. Industry", "2. Knowledge", "3. Task", "4. Confirm",
+          "5. Steps", "6. Validate", "7. Simulate", "8. Export"]
 current = st.session_state.stage
 progress_cols = st.columns(len(stages))
 for i, (col, label) in enumerate(zip(progress_cols, stages), start=1):
@@ -348,10 +354,10 @@ elif st.session_state.stage == 5:
 
 
 # ════════════════════════════════════════════════════════════
-# STAGE 6 — VALIDATE + RESULTS (Checkpoints D + E)
+# STAGE 6 — VALIDATE (Checkpoint D)
 # ════════════════════════════════════════════════════════════
 elif st.session_state.stage == 6:
-    st.header("Step 6 — Validation & Results")
+    st.header("Step 6 — Validation")
 
     if st.session_state.validation is None:
         with st.spinner("Running industry-aware FSM validation..."):
@@ -362,9 +368,7 @@ elif st.session_state.stage == 6:
     wf = st.session_state.workflow
     val = st.session_state.validation
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Diagram", "✅ Validation", "📋 Steps", "🔧 JSON & Export"
-    ])
+    tab1, tab2, tab3 = st.tabs(["📊 Diagram", "✅ Validation", "📋 Steps"])
 
     # ── TAB 1: DIAGRAM ──
     with tab1:
@@ -395,11 +399,9 @@ elif st.session_state.stage == 6:
         except Exception as e:
             st.warning(f"Diagram error: {e}")
 
-    # ── TAB 2: VALIDATION (Checkpoint D) ──
+    # ── TAB 2: VALIDATION ──
     with tab2:
-        st.caption("🧑‍🔧 Checkpoint D: Review warnings — accept those that are "
-                   "fine for your context (e.g. proprietary equipment).")
-
+        st.caption("🧑‍🔧 Checkpoint D: Review warnings — accept those fine for your context.")
         if val["is_valid"]:
             st.success("✅ VALIDATION PASSED")
         else:
@@ -415,7 +417,6 @@ elif st.session_state.stage == 6:
             st.subheader("🔴 Errors")
             for e in val["errors"]:
                 st.error(f"[Type {e['error_type']}] Step {e['step_id']}: {e['message']}")
-
         if val["warnings"]:
             st.subheader("🟡 Warnings")
             for w in val["warnings"]:
@@ -436,31 +437,201 @@ elif st.session_state.stage == 6:
                 st.write(f"Input: `{inp.get('value','N/A')}` ({inp.get('type','N/A')})")
                 st.write(f"Output: `{out.get('value','N/A')}` ({out.get('type','N/A')})")
 
-    # ── TAB 4: JSON & EXPORT (Checkpoint E) ──
-    with tab4:
-        st.caption("🧑‍🔧 Checkpoint E: Final human sign-off before export — "
-                   "creates accountability and an audit trail.")
-        st.json(wf)
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶ Continue to Flow Simulation", type="primary"):
+            go_to(7)
+            st.rerun()
+    with col2:
+        if st.button("← Back to Steps"):
+            go_to(5)
+            st.rerun()
 
-        approver = st.text_input("Your name/role (for audit trail):")
-        if st.button("✅ Approve & Export", type="primary"):
-            if approver.strip():
-                export = dict(wf)
-                export["approved_by"] = approver
-                export["industry"] = st.session_state.industry_key
-                export["validation_summary"] = {
-                    "passed": val["is_valid"],
-                    "twin_readiness": val["completeness_score"]
+
+# ════════════════════════════════════════════════════════════
+# STAGE 7 — FLOW SIMULATION (the digital twin bridge)
+# ════════════════════════════════════════════════════════════
+elif st.session_state.stage == 7:
+    st.header("Step 7 — Flow Simulation")
+    st.caption("🧑‍🔧 AI proposes durations with reasoning → you review and enter "
+               "real data → every number's source stays transparent.")
+
+    wf = st.session_state.workflow
+
+    # Get AI-proposed durations once
+    if st.session_state.duration_table is None:
+        with st.spinner("AI is estimating step durations (with reasoning)..."):
+            try:
+                ai_durations = propose_durations(wf, st.session_state.industry_key)
+                st.session_state.duration_table = build_duration_table(wf, ai_durations)
+            except Exception as e:
+                st.error(f"Could not estimate durations: {e}")
+                st.stop()
+
+    table = st.session_state.duration_table
+
+    # Provenance summary at the top — the transparency metric
+    prov = provenance_summary(table)
+    st.progress(prov["grounded_pct"] / 100)
+    st.caption(f"**{prov['grounded_pct']}% grounded in real data** "
+               f"({prov['ai_estimated']} 🤖 AI-estimated, "
+               f"{prov['user_entered']} ✏️ user-entered). "
+               f"Replace estimates with real values to increase confidence.")
+
+    st.subheader("Step Durations — review and edit")
+    st.write("Edit any duration with your real data. The 🤖 tag flips to ✏️ when you do.")
+
+    # Editable duration table
+    for i, row in enumerate(table):
+        col1, col2, col3 = st.columns([3, 1.5, 1])
+        with col1:
+            tag = "🤖" if row["provenance"] == "ai_estimated" else "✏️"
+            st.write(f"{tag} **Step {row['step_id']}**: {row['description'][:45]}")
+            st.caption(f"Basis: {row['basis']}")
+        with col2:
+            new_val = st.number_input(
+                f"Seconds (step {row['step_id']})",
+                min_value=1,
+                value=int(row["duration_seconds"]),
+                key=f"dur_{row['step_id']}",
+                label_visibility="collapsed"
+            )
+            # If the user changed it, update provenance
+            if new_val != row["duration_seconds"]:
+                table[i]["duration_seconds"] = new_val
+                table[i]["provenance"] = "user_entered"
+        with col3:
+            st.write(f"`{row['component'][:12]}`")
+
+    # Run simulation on current table
+    sim = simulate(table)
+    st.session_state.sim_result = sim
+
+    st.divider()
+    st.subheader("📈 Simulation Results")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Cycle Time", f"{sim['cycle_time_minutes']} min")
+    m2.metric("Throughput", f"{sim['throughput_per_hour']}/hr")
+    m3.metric("Per 8h Shift", f"{sim['throughput_per_8h_shift']} units")
+
+    # Bottleneck callout — the operations insight
+    st.error(f"🔴 **Bottleneck: Step {sim['bottleneck_step_id']}** — "
+             f"{sim['bottleneck_description']} "
+             f"({sim['bottleneck_duration']}s, {sim['bottleneck_share_pct']}% of cycle time). "
+             f"This step limits your throughput — prioritize getting its real duration accurate.")
+
+    # ── TIMELINE / GANTT VIEW ──
+    st.subheader("⏱️ Process Timeline")
+    try:
+        timeline = graphviz.Digraph()
+        timeline.attr(rankdir="LR")
+        timeline.attr("node", shape="box", style="filled", fontname="Arial", fontsize="9")
+        cumulative = 0
+        for row in table:
+            sid = str(row["step_id"])
+            is_bottleneck = (row["step_id"] == sim["bottleneck_step_id"])
+            color = "#c0392b" if is_bottleneck else "#2980b9"
+            label = (f"Step {row['step_id']}\n{row['duration_seconds']}s\n"
+                     f"{row['utilization_pct']}% util")
+            timeline.node(sid, label, fillcolor=color, fontcolor="white")
+            cumulative += row["duration_seconds"]
+        # connect in order
+        for i in range(len(table) - 1):
+            timeline.edge(str(table[i]["step_id"]), str(table[i+1]["step_id"]))
+        st.graphviz_chart(timeline)
+        st.caption("🔴 Red = bottleneck step. Utilization % shows how busy each "
+                   "step is relative to the bottleneck.")
+    except Exception as e:
+        st.warning(f"Timeline error: {e}")
+
+    # ── WHAT-IF SLIDER ──
+    st.subheader("🎚️ What-If Analysis")
+    st.write(f"Drag to see: if you reduce the bottleneck (Step "
+             f"{sim['bottleneck_step_id']}) duration, how does throughput change?")
+
+    current_bottleneck = sim["bottleneck_duration"]
+    new_bottleneck = st.slider(
+        "Bottleneck duration (seconds)",
+        min_value=1,
+        max_value=int(current_bottleneck),
+        value=int(current_bottleneck)
+    )
+    new_throughput = round(3600 / new_bottleneck, 1) if new_bottleneck > 0 else 0
+    improvement = round(((new_throughput - sim["throughput_per_hour"])
+                         / sim["throughput_per_hour"]) * 100) if sim["throughput_per_hour"] > 0 else 0
+
+    wc1, wc2 = st.columns(2)
+    wc1.metric("New Throughput", f"{new_throughput}/hr",
+               delta=f"{improvement}%")
+    wc2.metric("New Per 8h Shift", f"{round(new_throughput * 8)} units")
+    st.caption("Note: this what-if assumes the bottleneck improves; if another step "
+               "becomes the new slowest step, real throughput would be capped by that.")
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶ Continue to Export", type="primary"):
+            go_to(8)
+            st.rerun()
+    with col2:
+        if st.button("← Back to Validation"):
+            go_to(6)
+            st.rerun()
+
+
+# ════════════════════════════════════════════════════════════
+# STAGE 8 — FINAL EXPORT (Checkpoint E)
+# ════════════════════════════════════════════════════════════
+elif st.session_state.stage == 8:
+    st.header("Step 8 — Final Sign-Off & Export")
+    st.caption("🧑‍🔧 Checkpoint E: Final human sign-off — creates accountability "
+               "and an audit trail before the output feeds a digital twin.")
+
+    wf = st.session_state.workflow
+    val = st.session_state.validation
+    sim = st.session_state.sim_result
+    table = st.session_state.duration_table
+    prov = provenance_summary(table) if table else {}
+
+    # Summary card
+    st.subheader("📋 Workflow Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Steps", val["total_steps"])
+    s2.metric("Twin-Readiness", f"{val['completeness_score']}%")
+    s3.metric("Cycle Time", f"{sim['cycle_time_minutes']} min" if sim else "N/A")
+    s4.metric("Data Grounded", f"{prov.get('grounded_pct', 0)}%")
+
+    st.json(wf)
+
+    approver = st.text_input("Your name/role (for audit trail):")
+    if st.button("✅ Approve & Export", type="primary"):
+        if approver.strip():
+            export = dict(wf)
+            export["approved_by"] = approver
+            export["industry"] = st.session_state.industry_key
+            export["validation_summary"] = {
+                "passed": val["is_valid"],
+                "twin_readiness": val["completeness_score"]
+            }
+            if sim:
+                export["simulation_summary"] = {
+                    "cycle_time_minutes": sim["cycle_time_minutes"],
+                    "throughput_per_hour": sim["throughput_per_hour"],
+                    "bottleneck_step_id": sim["bottleneck_step_id"],
+                    "data_grounded_pct": prov.get("grounded_pct", 0)
                 }
-                st.download_button(
-                    "⬇️ Download Approved Workflow JSON",
-                    data=json.dumps(export, indent=2),
-                    file_name=f"{wf.get('task_name','workflow').replace(' ','_')}_approved.json",
-                    mime="application/json"
-                )
-                st.success(f"Approved by {approver}. Ready for digital twin import.")
-            else:
-                st.warning("Please enter your name/role to approve.")
+                export["step_durations"] = table
+            st.download_button(
+                "⬇️ Download Approved Workflow JSON",
+                data=json.dumps(export, indent=2),
+                file_name=f"{wf.get('task_name','workflow').replace(' ','_')}_approved.json",
+                mime="application/json"
+            )
+            st.success(f"Approved by {approver}. Ready for digital twin import.")
+        else:
+            st.warning("Please enter your name/role to approve.")
 
     st.divider()
     if st.button("🔄 Start New Workflow"):
